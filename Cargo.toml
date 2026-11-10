@@ -1,0 +1,29 @@
+[package]
+name = "lnfs-lite-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+description = "A compact Linux long-filename filesystem with mandatory FUSE passthrough"
+repository = "https://github.com/ImoutoHeaven/lnfs-lite-rs"
+
+[lib]
+name = "lnfs_lite"
+
+[[bin]]
+name = "lnfs-lite"
+path = "src/main.rs"
+
+[dependencies]
+fuser = { version = "=0.17.0", default-features = false }
+libc = "0.2"
+parking_lot = "0.12"
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

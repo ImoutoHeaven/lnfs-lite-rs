@@ -1,0 +1,4 @@
+/target/
+/docs/*
+!/docs/lnfs-lite-design.md
+__pycache__/

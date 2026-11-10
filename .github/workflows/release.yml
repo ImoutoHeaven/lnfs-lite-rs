@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish Linux release
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        run: rustup toolchain install 1.92.0 --profile minimal
+      - name: Build and verify package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo +1.92.0 build --locked --release
+          python3 scripts/package_release.py --tag "$RELEASE_TAG"
+          cd dist
+          sha256sum --check SHA256SUMS
+          tar -tzf *.tar.gz
+      - name: Preserve release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "Lnfs-Lite $RELEASE_TAG" \
+            --notes 'Linux x86-64 GNU build. Requires glibc 2.39+, Linux 6.12+ with enabled FUSE passthrough and O_PATH backing registration, root with CAP_SYS_ADMIN, and a dedicated case-sensitive ext4, XFS or Btrfs backend. There is no userspace data fallback. The archive includes the executable, build ABI/provenance information, documentation, MIT license and locked third-party notices. See README and the design document for format 3, durability and resource limits.'

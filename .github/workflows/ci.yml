@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+      - name: Format
+        run: cargo +1.92.0 fmt --all -- --check
+      - name: Lint
+        run: cargo +1.92.0 clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo +1.92.0 test --locked --all-targets
+      - name: Build release
+        run: cargo +1.92.0 build --locked --release
+      - name: Validate test scripts and package helper
+        run: |
+          python3 -m py_compile tests/mounted.py tests/adversarial.py tests/absolute.py scripts/package_release.py
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          bash -n tests/backend.sh
+      - name: Verify release package and ABI
+        shell: bash
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          python3 scripts/package_release.py --tag "v$version" --output target/package-check
+          cd target/package-check
+          sha256sum --check SHA256SUMS
+          tar -tzf *.tar.gz
+      - name: Tracked document policy
+        shell: bash
+        run: |
+          actual=$(git ls-files docs)
+          test "$actual" = docs/lnfs-lite-design.md
+
+  mounted:
+    name: Mounted / ${{ matrix.filesystem }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        filesystem: [ext4, xfs, btrfs]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install build and filesystem tools
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends e2fsprogs xfsprogs btrfs-progs
+          sudo modprobe fuse
+          test -c /dev/fuse
+      - name: Build release
+        run: cargo +1.92.0 build --locked --release
+      - name: Required mounted acceptance
+        run: sudo env LNFS_TEST_ARTIFACTS="$PWD/target/mounted-artifacts/${{ matrix.filesystem }}" bash tests/backend.sh '${{ matrix.filesystem }}' target/release/lnfs-lite
+      - name: Preserve mounted evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mounted-${{ matrix.filesystem }}
+          path: target/mounted-artifacts/${{ matrix.filesystem }}
+          if-no-files-found: warn
+          retention-days: 14
