@@ -22,13 +22,13 @@ jobs:
         run: cargo +1.92.0 fmt --all -- --check
       - name: Lint
         run: cargo +1.92.0 clippy --locked --all-targets -- -D warnings
-      - name: Tests
-        run: cargo +1.92.0 test --locked --all-targets
+      - name: Required native-handle tests
+        run: sudo env CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" "$(command -v cargo)" +1.92.0 test --locked --all-targets
       - name: Build release
         run: cargo +1.92.0 build --locked --release
       - name: Validate test scripts and package helper
         run: |
-          python3 -m py_compile tests/mounted.py tests/adversarial.py tests/absolute.py scripts/package_release.py
+          python3 -m py_compile tests/mounted.py tests/adversarial.py tests/v020.py tests/absolute.py scripts/package_release.py
           python3 -m unittest discover -s scripts -p 'test_*.py'
           bash -n tests/backend.sh
       - name: Verify release package and ABI

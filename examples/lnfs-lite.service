@@ -1,0 +1,17 @@
+[Unit]
+Description=Lnfs-Lite long filename filesystem
+After=local-fs.target
+RequiresMountsFor=/srv/lnfs-backend /mnt/lnfs
+
+[Service]
+Type=simple
+User=root
+# Keep ordinary root capabilities, including CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH.
+# A busy SIGTERM keeps serving; close clients then umount or send SIGTERM again.
+# Do not force-kill a busy filesystem during service stop.
+ExecStart=/usr/local/bin/lnfs-lite --backend /srv/lnfs-backend /mnt/lnfs
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+
+[Install]
+WantedBy=multi-user.target

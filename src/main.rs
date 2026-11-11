@@ -46,15 +46,26 @@ fn validate_paths(backend: &Path, mountpoint: &Path) -> io::Result<(PathBuf, Pat
 fn check_privileges() -> io::Result<()> {
     // The owner-only release deliberately serves root, not a privileged multiuser proxy.
     if unsafe { libc::geteuid() } != 0 {
-        return Err(io::Error::other("run as root with CAP_SYS_ADMIN"));
+        return Err(io::Error::other(
+            "run as root with CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH",
+        ));
     }
     let status = std::fs::read_to_string("/proc/self/status")?;
     let capabilities = status.lines().find_map(|line| {
         line.strip_prefix("CapEff:")
             .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
     });
+    check_capabilities(capabilities)
+}
+
+fn check_capabilities(capabilities: Option<u64>) -> io::Result<()> {
     if capabilities.is_none_or(|bits| bits & (1 << 21) == 0) {
         return Err(io::Error::other("FUSE passthrough requires CAP_SYS_ADMIN"));
+    }
+    if capabilities.is_none_or(|bits| bits & (1 << 2) == 0) {
+        return Err(io::Error::other(
+            "native file handles require CAP_DAC_READ_SEARCH",
+        ));
     }
     Ok(())
 }
@@ -197,6 +208,15 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_handles_require_dac_read_search_independently_of_sys_admin() {
+        let error = check_capabilities(Some(1 << 21)).unwrap_err();
+        assert!(error.to_string().contains("CAP_DAC_READ_SEARCH"));
+        assert!(check_capabilities(Some((1 << 21) | (1 << 2))).is_ok());
+        assert!(check_capabilities(Some(1 << 2)).is_err());
+        assert!(check_capabilities(None).is_err());
+    }
 
     #[test]
     fn rejects_nested_nonempty_and_symlink_alias_mountpoints() {

@@ -17,12 +17,16 @@ resource recovery and real passthrough validation remain required.
 
 ## Supported system and operations
 
-Require effective root with CAP_SYS_ADMIN, /dev/fuse, /proc/self/fd and Linux
-6.12+ with enabled FUSE passthrough and O_PATH backing registration. Upstream
+Require effective root with CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH, /dev/fuse,
+/proc/self/fd and Linux 6.12+ with enabled FUSE passthrough and O_PATH backing registration. Upstream
 Linux added O_PATH registration in 6.12; earlier passthrough support alone is
 insufficient for this implementation. Distribution backports are not certified.
 The upstream binding is fuser 0.17.0. Negotiation and backing registration must
-succeed; unexpected userspace read/write callbacks return EIO. Writeback cache is disabled. Four blocking request receivers are
+succeed; unexpected userspace read/write callbacks return EIO. Startup also
+captures and reopens a native handle on the actual backend and checks device/inode
+identity. CAP_SYS_ADMIN does not imply CAP_DAC_READ_SEARCH; service policies must
+retain both, along with their other required root capabilities. There is no
+cold-handle fallback. Writeback cache is disabled. Four blocking request receivers are
 the default, with cloned FUSE descriptors; --threads accepts 1 through 64.
 
 The mount uses owner-only access, default_permissions, nosuid and nodev. The
@@ -35,11 +39,12 @@ cooperating daemons; it cannot stop external root changes.
 | Operation | Contract |
 | --- | --- |
 | Regular files and directories | Raw names up to 1024 bytes |
-| Symlinks | Short names; target bytes preserved |
-| Hardlinks and special-file creation | EOPNOTSUPP |
-| Long symlink or special-file names | Rejected before mutation |
-| Rename | Native overwrite and RENAME_NOREPLACE |
-| EXCHANGE / WHITEOUT | EOPNOTSUPP; unknown flags EINVAL |
+| Symlinks | Names up to 1024 bytes; relative/absolute/dangling target bytes preserved |
+| FIFO / Unix socket nodes | Names up to 1024 bytes; kernel communication; socket addresses retain Linux sockaddr_un limit |
+| Hardlinks and character/block device nodes | EOPNOTSUPP |
+| Rename | Native overwrite, RENAME_NOREPLACE and RENAME_EXCHANGE |
+| WHITEOUT / invalid combinations | EOPNOTSUPP / EINVAL |
+| copy_file_range | One native call, explicit checked offsets, no userspace fallback |
 | Ordinary user xattrs | Forwarded except private Lnfs-Lite keys |
 | ACL/security/trusted xattr changes | Unsupported |
 | NFS/export, multiuser serving, online migration | Unsupported |
@@ -75,8 +80,10 @@ hash collision table or separate name-to-object transaction.
 A unique 300-byte name needs one intermediate directory; a unique 1024-byte
 name needs four. Shared prefixes reduce that cost. The private root is separate.
 Valid empty prefixes contain no logical object. Unknown or malformed private
-objects, excessive depth, unsupported terminal types, multiply linked regular
-files and nested mounts cause errors and are preserved. Historical `.index`
+objects, excessive depth and unsupported terminal types cause errors and are
+preserved. Authoritative operations reject multiply linked nondirectories and
+nested mounts. READDIR may list otherwise-supported terminal d_type hints before
+link-count/mount checks; listing is not certification of an object's validity. Historical `.index`
 and `.index.tmp.*` objects are unknown inside a private tree; ordinary short
 logical names such as `.index` remain legal.
 
@@ -84,13 +91,16 @@ Private `user.lnfs_lite.*` xattrs are hidden and cannot be changed through
 the mount. An unmarked nonempty backend or any other format marker is rejected
 without modifying it. Format 3 is independent of v2 and unreleased Lite formats
 1/2. Migration is a verified copy through mounted views into a fresh backend;
-there is no format guessing or in-place migration.
+there is no format guessing or in-place migration. Version 0.2.0 retains this
+encoding but accepts long symlink/FIFO/socket terminals that 0.1.0 rejects.
+Remove or copy those objects through the 0.2.0 mount before downgrading. ZFS has
+not received the required complete validation and is not certified.
 
 ## FD-relative access and native work
 
 Resolution starts from a stable logical-directory FD. openat2 uses
 RESOLVE_BENEATH, RESOLVE_NO_XDEV and RESOLVE_NO_SYMLINKS, without fallback.
-Final O_PATH|O_NOFOLLOW preserves short symlink identity; intermediate symlinks
+Final O_PATH|O_NOFOLLOW preserves symlink identity; intermediate symlinks
 remain forbidden. Full logical ancestor paths are never reconstructed.
 
 A borrowed Directory pairs a validated FD with its native device/inode identity.
@@ -109,27 +119,38 @@ ENOENT on an already-open removed directory is EOF; other errors remain errors.
 | Operation | Necessary native work and ownership |
 | --- | --- |
 | Lookup | Strict relative open, native identity/type/link/mount checks; a directory also pins its logical parent |
-| Create/mkdir | Prepare missing canonical prefixes, one terminal create, validation/publication; long names touch logical-parent timestamps |
-| Rename | Validate both routes, preduplicate a moved directory's new parent, one terminal renameat2, parent update and eager old-prefix pruning |
+| Create/mkdir/symlink/mknod | Prepare missing canonical prefixes, one terminal creation, validation/publication; long names touch logical-parent timestamps |
+| Rename | Validate both routes, prepare moved directory parents, one terminal renameat2, parent updates and ordinary-rename old-prefix pruning |
+| EXCHANGE | Both endpoints exist; prepare both directory parents, one native exchange, update both parents; no empty-target cleanup, prefix creation or pruning |
 | Unlink/rmdir | One terminal removal after validation, then eager empty-prefix pruning; directories validate private branches before removal |
-| READDIR | Fresh native scan for each new/rewound/changed view, complete long-tree validation and one byte-order sort |
-| Open | Reopen pinned native inode in requested mode; register backing only when no live registration exists |
+| READDIR | Fresh scan for each new/rewound/changed view, strict fragment grammar/routes, terminal hints and one byte-order sort |
+| Open | Materialize a linked cold regular identity if necessary, reopen in requested mode, register backing only when no live registration exists |
+| copy_file_range | Retain source/target data handles across one native call; handle-table locks end before the call |
 | File fsync | One native fsync/fdatasync on the handle's data FD |
 | Directory fsync | Bottom-up private-fragment sync, private root, then logical directory |
 
 Path depth, existing prefixes and listing size determine the exact syscall and
 allocation counts. No constant count is claimed for recursive operations.
-Short READDIR entries are native inode/type hints; an unknown d_type requires
-a stat. Actual lookup/open/removal still validates short objects and routes.
-Every canonical long-tree listing validates the entire tree before emitting
-its first reply; a late error discards that reply.
+Short and encoded-terminal READDIR entries are native inode/type hints; unknown
+d_type requires a strict stat. Supported types are regular, directory, symlink,
+FIFO and socket. Actual lookup/open/removal still validates objects and routes.
+The complete private-fragment grammar, depth and intermediate directory routes
+are checked before the first listing reply; a late error discards that reply.
+ListingHints and StrictDurability are distinct traversal purposes. fsyncdir
+strictly checks every encoded terminal and syncs private fragments bottom-up;
+it does not recursively stat every ordinary short child. Reconstructed names
+allocate their exact prefix-plus-suffix capacity once, without a new cache.
 
 ## Namespace and mutation outcomes
 
 One namespace read/write guard coordinates resolution, publication, logical
 parent updates and directory generations. Lookup holds its read guard through
 inode interning; creation holds its write guard through publication and first
-intern. Inode/handle table mutexes do not span native I/O.
+intern. The handle-table mutex only retrieves strong references. The inode-table mutex
+serializes cold materialization and pin removal, including the required native
+handle reopen/identity check and pin fstat; it must not release a token before
+reopen and let deletion overtake it. Namespace mutation remains globally
+serialized. There are no per-directory locks or new notification protocols.
 
 Long changes touch logical-parent mtime/ctime without changing atime. Touch
 once for a same-parent change, both parents for a cross-parent move.
@@ -146,7 +167,7 @@ Only these dispatched terminal-syscall errors establish no publication:
 | Mutator | Known rejection errno values |
 | --- | --- |
 | Exclusive regular create/open | EEXIST, EMFILE, ENFILE |
-| Mkdir or symlink | EEXIST, ENOENT, ENOTDIR |
+| Mkdir, mknod or symlink | EEXIST, ENOENT, ENOTDIR |
 | File unlink | ENOENT, EISDIR, ENOTDIR |
 | Rmdir | ENOENT, ENOTEMPTY, ENOTDIR |
 | Rename | ENOENT, EEXIST, ENOTEMPTY, ENOTDIR, EISDIR, EXDEV |
@@ -179,7 +200,7 @@ repair because the kernel does not perform success-path invalidation.
    Under the write guard, update known state or poison Unknown state and
    reserve the single notification-pending slot.
 2. Drop namespace/table guards and invalidate affected directory mappings,
-   including the possibly moved/removed directory.
+   including up to two deduplicated moved/removed directories for EXCHANGE.
 3. For errors, reply before nonblocking submission of the dentry batch to one
    independent notifier worker. Never call inval_entry inline in its related
    FUSE callback or wait there for queue capacity.
@@ -207,13 +228,28 @@ all surrounding metadata independent of the daemon.
 
 ## Required lifetimes and resource costs
 
-Stable FDs pin live inode identity. Root protocol ID is 1; other IDs use checked
-native inode plus 2 under the single-filesystem contract. Lookup references,
-open-handle references and in-flight pins have distinct lifetimes. FORGET never
-closes a live handle, and native inode reuse cannot alias a still-pinned object.
+Root protocol ID is 1; other IDs use checked native inode plus 2 under the
+single-filesystem contract. Linked cold regular-file slots retain variable-length
+opaque native file handles, never an inode number used as a reopen token. Handle,
+native device/inode and immutable type checks reject stale or aliased identities.
+Directories, symlinks and special nodes retain FDs. Each materialized NodeRef owns
+an Arc FD independently of the slot pin, data FD and kernel backing registration.
+
+Before unlink or ordinary flags=0 overwrite, an existing live slot temporarily
+pins the authoritative victim while the namespace write guard excludes readers.
+After the native operation, fstat under the inode mutex clears that slot pin only
+when nlink remains positive; nlink=0 or failed fstat retains it conservatively.
+This applies to known and unknown outcomes without reclassifying the mutation.
+Nonzero rename flags do not pre-pin victims: NOREPLACE and EXCHANGE delete none.
+An active NodeRef keeps its FD even after a linked slot pin is cleared.
+
+Lookup references, open-handle references and in-flight references have distinct
+lifetimes. FORGET cannot close active references; deleted-object pins remain
+until lookup/open/in-flight ownership ends. These are semantic lifetimes, not
+an LRU cache or a guarantee of constant resources for arbitrary client activity.
 
 Simultaneous opens share one kernel backing registration. The Node keeps a weak
-reference; active file handles keep strong references. Register the stable
+reference; active file handles keep strong references. Register the materialized stable
 O_PATH FD, which the kernel reopens in the frontend access mode. Each file handle
 also owns a requested-mode data FD for sync, flush, fallocate and FD attributes.
 There is no idle backing cache.
@@ -237,7 +273,9 @@ admission budget, persistent snapshot or startup enumeration.
 
 | Resource | Lifetime and scaling |
 | --- | --- |
-| Inode identity FD | One per live protocol inode, held through lookup/open/in-flight ownership |
+| Cold linked regular identity | Variable-length opaque handle per live slot; no idle identity FD |
+| Active/deleted regular identity FD | Active NodeRefs own materialized FDs; a removed live slot retains its pin |
+| Other inode identity FD | Directory/symlink/special-node slots retain their FD |
 | Logical-parent FD | One additional FD per live nonroot directory Node |
 | Data FD | One per open regular-file handle |
 | Kernel backing | Shared per inode while active file handles exist; separate from daemon FD count/RSS |
@@ -273,8 +311,12 @@ Sync both logical parents after a cross-directory move, plus file data.
 
 Fresh initialization writes the exact format marker. Every accepted startup
 fsyncs the root before probe recovery/creation, including a retry after marker
-write succeeded but its prior sync failed. Startup checks xattrs, case
-sensitivity, proc-fd access, native rename and directory sync.
+write succeeded but its prior sync failed. Startup checks xattrs, case sensitivity, proc-fd access, native rename and
+directory sync. It reuses the linked ordinary probe file to capture a native
+handle, reopen it with open_by_handle_at and verify device/inode identity. Missing
+capture/reopen support or permissions, stale handles and identity mismatch reject
+startup with an operation-specific diagnostic. This preflight adds no alternate
+mode, persistent index or background recovery service.
 
 The root-only probe recognizes only single-link regular `file` and empty
 `before`/`after` directories; `FILE` is an absence-only case check.
@@ -290,12 +332,17 @@ Daemon-kill and injected-error tests are not hardware power-loss tests.
 
 ## Validation and publication
 
-Use locked Rust 1.92.0 format, warnings-as-errors Clippy, all-target tests and
-release build. tests/backend.sh runs real ext4/XFS/Btrfs mounted validation;
+Use locked Rust 1.92.0 format, warnings-as-errors Clippy, privileged all-target
+tests (actual native-handle preflight, no bypass) and release build. tests/backend.sh runs real ext4/XFS/Btrfs mounted validation;
 missing tools, privileges, backend or passthrough is failure, never a skip.
 Suites cover name boundaries/non-UTF-8, canonical rejection and preservation,
 namespace moves, directory cookies, retained data handles, fsync, low FDs,
-single-worker progress, busy unmount and kill/remount recovery.
+single-worker progress, busy unmount and kill/remount recovery. The v0.2 suite
+adds native copy results, long/raw symlinks, the EXCHANGE type/parent/name matrix,
+FIFO/socket communication, O_PATH unlink/overwrite, concurrent inode churn,
+12,000 rejected renames and 6,000 exchanges under RLIMIT_NOFILE=128. Frontend VFS
+can reject requests before FUSE; direct unit/fault tests independently validate
+pin reconciliation, failed fstat and FORGET/materialization races.
 
 Final runtime fault evidence is built from frozen isolated copies, with hooks
 after actual native success and before outcome classification for Unknown.
@@ -317,7 +364,7 @@ of exact design and source/evidence hashes.
 
 The initial release history is one commit after preserving original history.
 Review staged tree, verify identical final whole tree, push main and require
-that exact SHA's CI to pass before tagging v0.1.0. The release workflow reruns
+that exact SHA's CI to pass before tagging its matching release version. The release workflow reruns
 required CI, checks version, packages executable/documentation/MIT/dependency
 license texts and publishes checksums. Downloaded public assets must match
 checksums, permissions, declared architecture/ABI and version/help output.

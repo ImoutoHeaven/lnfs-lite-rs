@@ -11,10 +11,11 @@ use std::{
 };
 
 use fuser::{
-    AccessFlags, BackingId, BsdFileFlags, Errno, FileAttr, FileHandle as Fh, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek,
-    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    AccessFlags, BackingId, BsdFileFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle as Fh,
+    FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner,
+    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    WriteFlags,
 };
 use parking_lot::Mutex;
 
@@ -72,8 +73,9 @@ impl LiteFs {
         cross_parent: bool,
     ) -> (io::Result<T>, Option<InvalidationBatch>) {
         let repair = result.is_err() && namespace.needs_invalidation();
-        let directory = namespace.directory_to_invalidate();
-        let moved = cross_parent && namespace.did_commit() && directory.is_some();
+        let directories = namespace.directories_to_invalidate();
+        let moved =
+            cross_parent && namespace.did_commit() && directories.iter().any(Option::is_some);
         if !repair && !moved {
             return (result, None);
         }
@@ -92,13 +94,14 @@ impl LiteFs {
                 }
             }
         }
-        if let Some(native_ino) = directory
-            && let Err(err) = self
+        for native_ino in directories.into_iter().flatten() {
+            if let Err(err) = self
                 .inodes
                 .number(native_ino)
                 .and_then(|ino| self.invalidations.directory(ino))
-        {
-            failure.get_or_insert(err);
+            {
+                failure.get_or_insert(err);
+            }
         }
         if let Some(err) = failure {
             self.namespace.finish_notifications(false);
@@ -142,7 +145,10 @@ impl LiteFs {
             let batch = InvalidationBatch::one(parent.clone(), name);
             let mut namespace = self.namespace.write()?;
             parent.changed();
+            let entry = namespace.lookup(parent.fd.as_fd(), name)?;
+            let victim = self.inodes.pin_removed(entry)?;
             let result = namespace.unlink(parent.directory()?, name, directory);
+            self.inodes.release_linked_pin(victim);
             let (result, pending) = self.finish_mutation(namespace, result, batch, false);
             repair = pending;
             result
@@ -390,10 +396,6 @@ impl Filesystem for LiteFs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        if mode & libc::S_IFMT != libc::S_IFREG {
-            reply.error(Errno::EOPNOTSUPP);
-            return;
-        }
         let mut repair = None;
         let result = (|| {
             let parent = self.inodes.get(parent.0)?;
@@ -401,14 +403,8 @@ impl Filesystem for LiteFs {
             let mut namespace = self.namespace.write()?;
             parent.changed();
             let result = namespace
-                .create_file(
-                    parent.directory()?,
-                    name,
-                    mode & !umask,
-                    libc::O_WRONLY,
-                    |_, _| Ok(()),
-                )
-                .and_then(|(entry, _fd, ())| self.entry_attr(entry));
+                .mknod(parent.directory()?, name, mode & !umask)
+                .and_then(|entry| self.entry_attr(entry));
             let (result, pending) = self.finish_mutation(namespace, result, batch, false);
             repair = pending;
             result
@@ -473,6 +469,15 @@ impl Filesystem for LiteFs {
             if cross_parent {
                 newparent.changed();
             }
+            let victim = if flags.is_empty() {
+                match namespace.lookup(newparent.fd.as_fd(), newname) {
+                    Ok(entry) => Some(self.inodes.pin_removed(entry)?),
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
             let result = namespace.rename(
                 old_directory,
                 name,
@@ -481,6 +486,9 @@ impl Filesystem for LiteFs {
                 flags.bits(),
                 |native_ino, parent| self.inodes.reparent_native(native_ino, parent),
             );
+            if let Some(victim) = victim {
+                self.inodes.release_linked_pin(victim);
+            }
             let (result, pending) = self.finish_mutation(namespace, result, batch, cross_parent);
             repair = pending;
             result
@@ -684,6 +692,37 @@ impl Filesystem for LiteFs {
                 sys::cvt(unsafe { libc::fallocate(handle.fd.as_raw_fd(), mode, offset, length) })
             })(),
         );
+    }
+
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        ino_in: INodeNo,
+        fh_in: Fh,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: Fh,
+        offset_out: u64,
+        len: u64,
+        flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        let result = (|| {
+            let source = self.handles.file(fh_in.0, ino_in.0)?;
+            let target = self.handles.file(fh_out.0, ino_out.0)?;
+            sys::copy_file_range(
+                source.fd.as_fd(),
+                offset_in,
+                target.fd.as_fd(),
+                offset_out,
+                len,
+                flags.bits(),
+            )
+        })();
+        match result {
+            Ok(copied) => reply.written(copied),
+            Err(err) => reply.error(err.into()),
+        }
     }
 
     fn lseek(

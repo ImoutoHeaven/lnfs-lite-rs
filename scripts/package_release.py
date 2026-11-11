@@ -110,9 +110,10 @@ def main():
         raise FileExistsError("refusing to overwrite existing release assets")
     with tempfile.TemporaryDirectory(prefix="lnfs-package-") as temporary:
         staging = Path(temporary)
-        for name in ("LICENSE", "README.md"):
+        for name in ("LICENSE", "README.md", "CHANGELOG.md"):
             shutil.copyfile(ROOT / name, staging / name)
         shutil.copy2(binary, staging / "lnfs-lite")
+        shutil.copytree(ROOT / "examples", staging / "examples")
         (staging / "docs").mkdir()
         shutil.copyfile(ROOT / "docs/lnfs-lite-design.md", staging / "docs/lnfs-lite-design.md")
         notices = staging / "THIRD_PARTY_LICENSES"

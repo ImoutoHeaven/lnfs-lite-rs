@@ -295,7 +295,9 @@ def check_rename(root):
     expect_errno({errno.EEXIST}, renameat2, long_a, long_b, 1)
     assert read_file(long_a) == b"source"
     assert read_file(long_b) == b"target"
-    expect_errno({errno.EOPNOTSUPP, errno.EINVAL}, renameat2, long_a, long_b, 2)
+    renameat2(long_a, long_b, 2)
+    assert read_file(long_a) == b"target" and read_file(long_b) == b"source"
+    renameat2(long_a, long_b, 2)
     expect_errno({errno.EOPNOTSUPP, errno.EINVAL}, renameat2, long_a, long_b, 4)
     expect_errno({errno.EINVAL}, renameat2, long_a, long_b, 8)
     os.replace(long_a, long_b)
@@ -506,7 +508,8 @@ def check_metadata_and_scope(root):
     expect_errno({errno.ENODATA}, os.getxattr, path, b"security.capability")
     expect_errno({errno.ENODATA}, os.getxattr, path, b"user.lnfs_lite.format")
     expect_errno({errno.EOPNOTSUPP, errno.EPERM}, os.link, path, root + b"/hard")
-    expect_errno({errno.EOPNOTSUPP, errno.EPERM}, os.mkfifo, root + b"/fifo")
+    os.mkfifo(root + b"/fifo", 0o600)
+    os.unlink(root + b"/fifo")
     symlink = root + b"/symlink"
     os.symlink(b"metadata", symlink)
     assert os.readlink(symlink) == b"metadata"
@@ -514,8 +517,14 @@ def check_metadata_and_scope(root):
     rawlink = root + b"/rawlink"
     os.symlink(b"target-\xff", rawlink)
     assert os.readlink(rawlink) == b"target-\xff"
-    expect_errno({errno.EOPNOTSUPP}, os.symlink, b"target", root + b"/" + b"s" * 256)
-    expect_errno({errno.EOPNOTSUPP}, os.rename, symlink, root + b"/" + b"s" * 300)
+    longlink = root + b"/" + b"s" * 256
+    os.symlink(b"target", longlink)
+    assert os.readlink(longlink) == b"target"
+    os.unlink(longlink)
+    movedlink = root + b"/" + b"s" * 300
+    os.rename(symlink, movedlink)
+    assert read_file(movedlink) == b"payload"
+    os.rename(movedlink, symlink)
     os.unlink(rawlink)
     os.unlink(symlink)
     os.unlink(path)

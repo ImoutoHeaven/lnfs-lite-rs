@@ -55,7 +55,7 @@ pub fn open_beneath(
         mode: mode as u64,
         resolve: 0x01 | 0x04 | 0x08, // NO_XDEV | NO_SYMLINKS | BENEATH.
     };
-    // open_how is the stable 24-byte Linux ABI. Linux 6.9+ is required, no fallback.
+    // open_how is the stable 24-byte Linux ABI; this filesystem requires Linux 6.12+.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
@@ -100,6 +100,106 @@ pub fn reopen(fd: BorrowedFd<'_>, flags: i32) -> io::Result<OwnedFd> {
     let path = proc_path(fd);
     // Follow the proc magic link to the pinned inode, not a reconstructed path.
     owned(unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) })
+}
+
+/// An opaque Linux export handle, including its kernel-provided type and length.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeHandle {
+    // u64 storage supplies the file_handle header's alignment without interpreting payload bytes.
+    words: Vec<u64>,
+}
+
+impl NativeHandle {
+    pub fn capture(fd: BorrowedFd<'_>) -> io::Result<Self> {
+        let header = std::mem::size_of::<libc::file_handle>();
+        let mut words = vec![0_u64; header.div_ceil(8)];
+        let mut mount_id = 0;
+        let ptr = words.as_mut_ptr().cast::<libc::file_handle>();
+        // A zero-sized payload asks the kernel for this object's required handle length.
+        let result = unsafe {
+            libc::name_to_handle_at(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                ptr,
+                &mut mount_id,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result == 0 {
+            return Err(crate::name::error(libc::EOPNOTSUPP));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EOVERFLOW) {
+            return Err(error);
+        }
+        let length = unsafe { (*ptr).handle_bytes as usize };
+        if length == 0 || length > libc::MAX_HANDLE_SZ as usize {
+            return Err(crate::name::error(libc::EOVERFLOW));
+        }
+        words.resize((header + length).div_ceil(8), 0);
+        let ptr = words.as_mut_ptr().cast::<libc::file_handle>();
+        // The kernel writes at most the advertised payload into this aligned allocation.
+        unsafe { (*ptr).handle_bytes = length as u32 };
+        cvt(unsafe {
+            libc::name_to_handle_at(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                ptr,
+                &mut mount_id,
+                libc::AT_EMPTY_PATH,
+            )
+        })?;
+        let actual = unsafe { (*ptr).handle_bytes as usize };
+        if actual == 0 || actual > length {
+            return Err(crate::name::error(libc::EIO));
+        }
+        let used = header + actual;
+        // Normalize alignment padding so equality compares exactly the returned handle.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8)
+        };
+        bytes[used..].fill(0);
+        words.truncate(used.div_ceil(8));
+        Ok(Self { words })
+    }
+
+    pub fn open(&self, mount: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+        let mut words = self.words.clone();
+        // open_by_handle_at consumes no ownership and the mutable ABI buffer stays live.
+        owned(unsafe {
+            libc::open_by_handle_at(
+                mount.as_raw_fd(),
+                words.as_mut_ptr().cast(),
+                libc::O_PATH | libc::O_CLOEXEC,
+            )
+        })
+    }
+}
+
+pub fn probe_native_handle(file: BorrowedFd<'_>, mount: BorrowedFd<'_>) -> io::Result<()> {
+    let handle = NativeHandle::capture(file).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("backend name_to_handle_at startup probe failed: {error}"),
+        )
+    })?;
+    let reopened = handle.open(mount).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("backend open_by_handle_at startup probe failed; CAP_DAC_READ_SEARCH is required: {error}"),
+        )
+    })?;
+    let expected = stat(file)?;
+    let actual = stat(reopened.as_fd())?;
+    if expected.st_dev != actual.st_dev
+        || expected.st_ino != actual.st_ino
+        || actual.st_mode & libc::S_IFMT != libc::S_IFREG
+    {
+        return Err(io::Error::other(
+            "backend file-handle startup probe reopened the wrong identity",
+        ));
+    }
+    Ok(())
 }
 
 pub fn stat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
@@ -147,10 +247,50 @@ pub fn mkdir_at(parent: BorrowedFd<'_>, name: &CStr, mode: u32) -> io::Result<()
     cvt(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) })
 }
 
+pub fn mknod_at(parent: BorrowedFd<'_>, name: &CStr, mode: u32) -> io::Result<()> {
+    // Only regular files, FIFOs and sockets reach this call; no device number is used.
+    cvt(unsafe { libc::mknodat(parent.as_raw_fd(), name.as_ptr(), mode, 0) })
+}
+
 pub fn unlink_at(parent: BorrowedFd<'_>, name: &CStr, directory: bool) -> io::Result<()> {
     let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
     // The string and borrowed FD remain live until unlinkat returns.
     cvt(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) })
+}
+
+pub fn copy_file_range(
+    source: BorrowedFd<'_>,
+    offset_in: u64,
+    target: BorrowedFd<'_>,
+    offset_out: u64,
+    len: u64,
+    flags: u64,
+) -> io::Result<u32> {
+    if flags != 0 {
+        return Err(crate::name::error(libc::EINVAL));
+    }
+    let mut offset_in: libc::off64_t = offset_in
+        .try_into()
+        .map_err(|_| crate::name::error(libc::EFBIG))?;
+    let mut offset_out: libc::off64_t = offset_out
+        .try_into()
+        .map_err(|_| crate::name::error(libc::EFBIG))?;
+    // Local offsets preserve both open descriptions' positions. One syscall may copy short.
+    let copied = unsafe {
+        libc::copy_file_range(
+            source.as_raw_fd(),
+            &mut offset_in,
+            target.as_raw_fd(),
+            &mut offset_out,
+            len.min(u32::MAX as u64) as usize,
+            0,
+        )
+    };
+    if copied < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(copied as u32)
+    }
 }
 
 pub fn rename_at(
@@ -347,6 +487,39 @@ fn decode_dirent(bytes: &[u8]) -> io::Result<(DirectoryEntry, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_handle_probe_reports_reopen_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(temp.path().join("file")).unwrap();
+        let wrong_mount = std::fs::File::open("/proc/self").unwrap();
+        let error = probe_native_handle(file.as_fd(), wrong_mount.as_fd()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("open_by_handle_at startup probe failed")
+        );
+        assert!(error.to_string().contains("CAP_DAC_READ_SEARCH"));
+    }
+
+    #[test]
+    fn native_handles_roundtrip_and_distinguish_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = open_root(temp.path()).unwrap();
+        let a = std::fs::File::create(temp.path().join("a")).unwrap();
+        let b = std::fs::File::create(temp.path().join("b")).unwrap();
+        let handle = NativeHandle::capture(a.as_fd()).unwrap();
+        assert_eq!(handle, NativeHandle::capture(a.as_fd()).unwrap());
+        assert_ne!(handle, NativeHandle::capture(b.as_fd()).unwrap());
+        let reopened = handle.open(root.as_fd()).unwrap();
+        let expected = stat(a.as_fd()).unwrap();
+        let actual = stat(reopened.as_fd()).unwrap();
+        assert_eq!(
+            (actual.st_dev, actual.st_ino),
+            (expected.st_dev, expected.st_ino)
+        );
+        probe_native_handle(a.as_fd(), root.as_fd()).unwrap();
+    }
     use std::collections::HashSet;
     use std::fs::File;
     use std::os::unix::ffi::OsStringExt;
@@ -361,6 +534,95 @@ mod tests {
         bytes[19..19 + name.len()].copy_from_slice(name);
         bytes[19 + name.len()] = 0;
         bytes
+    }
+
+    #[test]
+    fn copy_range_preserves_positions_and_native_errors() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let source_path = temp.path().join("source");
+        let target_path = temp.path().join("target");
+        let mut source = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        let mut target = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&target_path)
+            .unwrap();
+        source.write_all(b"abcdefgh").unwrap();
+        target.write_all(b"0123456789").unwrap();
+        source.seek(SeekFrom::Start(7)).unwrap();
+        target.seek(SeekFrom::Start(8)).unwrap();
+        assert_eq!(
+            copy_file_range(source.as_fd(), 2, target.as_fd(), 3, 4, 0).unwrap(),
+            4
+        );
+        assert_eq!(source.stream_position().unwrap(), 7);
+        assert_eq!(target.stream_position().unwrap(), 8);
+        target.rewind().unwrap();
+        let mut data = String::new();
+        target.read_to_string(&mut data).unwrap();
+        assert_eq!(data, "012cdef789");
+        assert_eq!(
+            copy_file_range(source.as_fd(), 8, target.as_fd(), 0, 8, 0).unwrap(),
+            0
+        );
+        assert_eq!(
+            copy_file_range(source.as_fd(), 0, target.as_fd(), 0, 0, 0).unwrap(),
+            0
+        );
+        assert_eq!(
+            copy_file_range(source.as_fd(), 6, target.as_fd(), 10, u64::MAX, 0).unwrap(),
+            2
+        );
+        assert_eq!(stat(target.as_fd()).unwrap().st_size, 12);
+        assert_eq!(
+            copy_file_range(source.as_fd(), 0, source.as_fd(), 1, 4, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        let readonly = File::open(&target_path).unwrap();
+        assert_eq!(
+            copy_file_range(source.as_fd(), 0, readonly.as_fd(), 0, 1, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(target_path).unwrap();
+        assert_eq!(
+            copy_file_range(source.as_fd(), 0, target.as_fd(), 0, 8, 0).unwrap(),
+            8
+        );
+        assert_eq!(stat(source.as_fd()).unwrap().st_nlink, 0);
+        assert_eq!(stat(target.as_fd()).unwrap().st_nlink, 0);
+    }
+
+    #[test]
+    fn copy_range_rejects_unrepresentable_offsets_and_all_flag_bits() {
+        let file = tempfile::tempfile().unwrap();
+        for (source, target) in [(u64::MAX, 0), (0, u64::MAX), (1 << 63, 0), (0, 1 << 63)] {
+            assert_eq!(
+                copy_file_range(file.as_fd(), source, file.as_fd(), target, 0, 0)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EFBIG)
+            );
+        }
+        for flags in [1, 1 << 32, 1 << 63, u64::MAX] {
+            assert_eq!(
+                copy_file_range(file.as_fd(), 0, file.as_fd(), 0, 0, flags)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+        }
     }
 
     #[test]

@@ -45,4 +45,4 @@ jobs:
         run: |
           gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS \
             --verify-tag --title "Lnfs-Lite $RELEASE_TAG" \
-            --notes 'Linux x86-64 GNU build. Requires glibc 2.39+, Linux 6.12+ with enabled FUSE passthrough and O_PATH backing registration, root with CAP_SYS_ADMIN, and a dedicated case-sensitive ext4, XFS or Btrfs backend. There is no userspace data fallback. The archive includes the executable, build ABI/provenance information, documentation, MIT license and locked third-party notices. See README and the design document for format 3, durability and resource limits.'
+            --notes-file CHANGELOG.md

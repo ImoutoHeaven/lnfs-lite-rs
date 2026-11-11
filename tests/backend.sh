@@ -101,3 +101,4 @@ loop=$(losetup --find --show "$scratch/backing.img")
 mount "$loop" "$scratch/fs"
 python3 "$repo/tests/mounted.py" "$binary" --root "$scratch/fs" 2>&1 | tee "$artifacts/mounted.log"
 python3 "$repo/tests/adversarial.py" "$binary" --root "$scratch/fs" 2>&1 | tee "$artifacts/adversarial.log"
+python3 "$repo/tests/v020.py" "$binary" --root "$scratch/fs" 2>&1 | tee "$artifacts/v020.log"

@@ -6,6 +6,7 @@ import errno
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -206,17 +207,23 @@ def unsupported_encoded_objects(binary, root):
     os.link(backend, alias)
     with Mount(binary, root) as mounted:
         expect_errno({errno.EOPNOTSUPP}, os.unlink, os.fsencode(mounted.path) + b"/" + name)
-        expect_errno({errno.EOPNOTSUPP}, os.listdir, mounted.path)
+        assert set(os.listdir(os.fsencode(mounted.path))) == {name, b"alias"}
+        expect_errno({errno.EOPNOTSUPP}, os.lstat, os.fsencode(mounted.path) + b"/" + name)
+        directory = os.open(mounted.path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            expect_errno({errno.EOPNOTSUPP}, os.fsync, directory)
+        finally:
+            os.close(directory)
     alias.unlink()
-    for make in (lambda: os.symlink("missing", backend), lambda: os.mkfifo(backend)):
+    for kind in (stat.S_IFCHR, stat.S_IFBLK):
         backend.unlink()
-        make()
+        os.mknod(backend, kind | 0o600, os.makedev(1, 7))
         with Mount(binary, root) as mounted:
             expect_errno({errno.EOPNOTSUPP}, os.unlink, os.fsencode(mounted.path) + b"/" + name)
             expect_errno({errno.EOPNOTSUPP}, os.listdir, mounted.path)
         backend.unlink()
         backend.write_bytes(b"payload")
-    print("PASS canonical long terminals reject hardlinks, symlinks and FIFO", flush=True)
+    print("PASS READDIR hardlink hints with strict object/fsync rejection; device terminals preserved", flush=True)
 
 
 def intermediate_boundary(binary, root):
@@ -341,13 +348,15 @@ def rejected_privileges_and_backend(binary, root):
     mountpoint = root / "mount"
     backend.mkdir()
     mountpoint.mkdir()
-    result = subprocess.run([
-        "setpriv", "--bounding-set=-sys_admin", binary,
-        "--backend", str(backend), str(mountpoint),
-    ], capture_output=True, timeout=10)
-    assert result.returncode != 0 and b"CAP_SYS_ADMIN" in result.stderr, result.stderr
-    assert not os.path.ismount(mountpoint)
-    assert not os.listdir(backend)
+    for capability, diagnostic in (("sys_admin", b"CAP_SYS_ADMIN"),
+                                   ("dac_read_search", b"CAP_DAC_READ_SEARCH")):
+        result = subprocess.run([
+            "setpriv", "--bounding-set=-" + capability, binary,
+            "--backend", str(backend), str(mountpoint),
+        ], capture_output=True, timeout=10)
+        assert result.returncode != 0 and diagnostic in result.stderr, result.stderr
+        assert not os.path.ismount(mountpoint)
+        assert not os.listdir(backend)
     with tempfile.TemporaryDirectory(prefix="lnfs-unsupported-", dir="/dev/shm") as unsupported:
         result = subprocess.run([binary, "--backend", unsupported, str(mountpoint)], capture_output=True, timeout=10)
         assert result.returncode != 0 and b"backend must be" in result.stderr, result.stderr

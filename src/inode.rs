@@ -12,11 +12,14 @@ use std::{
 use fuser::BackingId;
 use parking_lot::Mutex;
 
-use crate::namespace::{DirKey, Directory, Entry};
+use crate::{
+    namespace::{DirKey, Directory, Entry},
+    sys::{self, NativeHandle},
+};
 
 pub struct Node {
     pub ino: u64,
-    pub fd: OwnedFd,
+    handle: Option<NativeHandle>,
     pub mode: u32,
     native_key: DirKey,
     pub backing: Mutex<Weak<BackingId>>,
@@ -42,21 +45,26 @@ impl Node {
 
 struct Slot {
     node: Arc<Node>,
+    pin: Option<Arc<OwnedFd>>,
     lookups: u64,
 }
 
 struct State {
     slots: HashMap<u64, Slot>,
+    #[cfg(test)]
+    pin_stat_error: Option<i32>,
 }
 
 pub struct Inodes {
     state: Arc<Mutex<State>>,
+    mount: Arc<OwnedFd>,
     root_dev: u64,
     root_ino: u64,
 }
 
-/// A request or open handle pins the same identity even after its last FORGET.
+/// Every request and open handle owns its FD independently of the slot's pin.
 pub struct NodeRef {
+    pub fd: Arc<OwnedFd>,
     node: Option<Arc<Node>>,
     state: Weak<Mutex<State>>,
 }
@@ -70,6 +78,7 @@ impl NodeRef {
 impl Clone for NodeRef {
     fn clone(&self) -> Self {
         Self {
+            fd: self.fd.clone(),
             node: self.node.clone(),
             state: self.state.clone(),
         }
@@ -117,9 +126,10 @@ fn reap(state: &mut State, ino: u64) -> Option<Slot> {
 
 impl Inodes {
     pub fn new(fd: OwnedFd, stat: libc::stat) -> Self {
+        let fd = Arc::new(fd);
         let node = Arc::new(Node {
             ino: 1,
-            fd,
+            handle: None,
             mode: stat.st_mode,
             native_key: DirKey {
                 dev: stat.st_dev,
@@ -130,10 +140,20 @@ impl Inodes {
             generation: AtomicU64::new(0),
         });
         Self {
+            mount: fd.clone(),
             root_dev: stat.st_dev,
             root_ino: stat.st_ino,
             state: Arc::new(Mutex::new(State {
-                slots: HashMap::from([(1, Slot { node, lookups: 0 })]),
+                slots: HashMap::from([(
+                    1,
+                    Slot {
+                        node,
+                        pin: Some(fd),
+                        lookups: 0,
+                    },
+                )]),
+                #[cfg(test)]
+                pin_stat_error: None,
             })),
         }
     }
@@ -150,15 +170,37 @@ impl Inodes {
     }
 
     pub fn get(&self, ino: u64) -> io::Result<NodeRef> {
+        // Reopening and clearing a destructive-operation pin share this lock.
         let state = self.state.lock();
-        let node = state
+        let slot = state
             .slots
             .get(&ino)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
-            .node
-            .clone();
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+        let fd = match &slot.pin {
+            Some(fd) => fd.clone(),
+            None => {
+                let fd = slot
+                    .node
+                    .handle
+                    .as_ref()
+                    .expect("unpinned regular inode has a native handle")
+                    .open(self.mount.as_fd())?;
+                let stat = sys::stat(fd.as_fd())?;
+                if slot.node.native_key
+                    != (DirKey {
+                        dev: stat.st_dev,
+                        ino: stat.st_ino,
+                    })
+                    || stat.st_mode & libc::S_IFMT != slot.node.mode & libc::S_IFMT
+                {
+                    return Err(io::Error::from_raw_os_error(libc::ESTALE));
+                }
+                Arc::new(fd)
+            }
+        };
         Ok(NodeRef {
-            node: Some(node),
+            fd,
+            node: Some(slot.node.clone()),
             state: Arc::downgrade(&self.state),
         })
     }
@@ -169,40 +211,108 @@ impl Inodes {
             return Err(io::Error::from_raw_os_error(libc::EXDEV));
         }
         let ino = self.number(entry.stat.st_ino)?;
-        let mut unused = Some(entry);
-        let result = {
+        let handle =
+            if entry.stat.st_mode & libc::S_IFMT == libc::S_IFREG && entry.stat.st_nlink > 0 {
+                Some(NativeHandle::capture(entry.fd.as_fd())?)
+            } else {
+                None
+            };
+        let native_key = DirKey {
+            dev: entry.stat.st_dev,
+            ino: entry.stat.st_ino,
+        };
+        let fd = Arc::new(entry.fd);
+        let mut state = self.state.lock();
+        let slot = match state.slots.entry(ino) {
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                let slot = slot.into_mut();
+                if slot.node.native_key != native_key
+                    || slot.node.mode & libc::S_IFMT != entry.stat.st_mode & libc::S_IFMT
+                    || slot.node.handle != handle
+                {
+                    return Err(io::Error::from_raw_os_error(libc::ESTALE));
+                }
+                slot
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(Slot {
+                pin: handle.is_none().then(|| fd.clone()),
+                node: Arc::new(Node {
+                    ino,
+                    handle,
+                    mode: entry.stat.st_mode,
+                    native_key,
+                    backing: Mutex::new(Weak::new()),
+                    parent: Mutex::new(entry.parent),
+                    generation: AtomicU64::new(0),
+                }),
+                lookups: 0,
+            }),
+        };
+        slot.lookups = slot
+            .lookups
+            .checked_add(lookups)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+        Ok(NodeRef {
+            fd,
+            node: Some(slot.node.clone()),
+            state: Arc::downgrade(&self.state),
+        })
+    }
+
+    /// Pin only a live victim, before unlink or flags=0 overwrite, under the write guard.
+    pub fn pin_removed(&self, entry: Entry) -> io::Result<u64> {
+        if entry.stat.st_dev != self.root_dev {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        let ino = self.number(entry.stat.st_ino)?;
+        let mut state = self.state.lock();
+        if let Some(slot) = state.slots.get_mut(&ino) {
+            if slot.node.native_key
+                != (DirKey {
+                    dev: entry.stat.st_dev,
+                    ino: entry.stat.st_ino,
+                })
+                || slot.node.mode & libc::S_IFMT != entry.stat.st_mode & libc::S_IFMT
+            {
+                return Err(io::Error::from_raw_os_error(libc::ESTALE));
+            }
+            if let Some(handle) = &slot.node.handle {
+                if handle != &NativeHandle::capture(entry.fd.as_fd())? {
+                    return Err(io::Error::from_raw_os_error(libc::ESTALE));
+                }
+                if slot.pin.is_none() {
+                    slot.pin = Some(Arc::new(entry.fd));
+                }
+            }
+        }
+        Ok(ino)
+    }
+
+    /// Reconcile under the same write guard, independently of the mutation outcome.
+    pub fn release_linked_pin(&self, ino: u64) {
+        let released = {
             let mut state = self.state.lock();
-            let slot = state.slots.entry(ino).or_insert_with(|| {
-                let entry = unused.take().expect("new inode entry");
-                Slot {
-                    node: Arc::new(Node {
-                        ino,
-                        fd: entry.fd,
-                        mode: entry.stat.st_mode,
-                        native_key: DirKey {
-                            dev: entry.stat.st_dev,
-                            ino: entry.stat.st_ino,
-                        },
-                        backing: Mutex::new(Weak::new()),
-                        parent: Mutex::new(entry.parent),
-                        generation: AtomicU64::new(0),
-                    }),
-                    lookups: 0,
-                }
-            });
-            match slot.lookups.checked_add(lookups) {
-                Some(lookups) => {
-                    slot.lookups = lookups;
-                    Ok(NodeRef {
-                        node: Some(slot.node.clone()),
-                        state: Arc::downgrade(&self.state),
-                    })
-                }
-                None => Err(io::Error::from_raw_os_error(libc::EOVERFLOW)),
+            #[cfg(test)]
+            let injected = state.pin_stat_error.take();
+            let Some(slot) = state.slots.get_mut(&ino) else {
+                return;
+            };
+            if slot.node.handle.is_none() {
+                return;
+            }
+            let Some(fd) = &slot.pin else {
+                return;
+            };
+            let stat = sys::stat(fd.as_fd());
+            #[cfg(test)]
+            let stat = injected.map_or(stat, |errno| Err(io::Error::from_raw_os_error(errno)));
+            if stat.is_ok_and(|stat| stat.st_nlink > 0) {
+                slot.pin.take()
+            } else {
+                None
             }
         };
-        drop(unused);
-        result
+        drop(released);
     }
 
     /// Called only after known-success native rename, under the write guard.
@@ -265,6 +375,170 @@ mod tests {
             fd: file.try_clone().unwrap().into(),
             stat,
             parent: None,
+        }
+    }
+
+    #[test]
+    fn cold_regular_slots_reopen_without_a_persistent_fd() {
+        let (_temp, table, file, stat) = fixture();
+        let node = table.intern(entry(&file, stat), 1).unwrap();
+        let ino = node.ino;
+        assert!(table.state.lock().slots[&ino].pin.is_none());
+        drop(node);
+        let reopened = table.get(ino).unwrap();
+        let actual = sys::stat(reopened.fd.as_fd()).unwrap();
+        assert_eq!((actual.st_dev, actual.st_ino), (stat.st_dev, stat.st_ino));
+        assert!(table.state.lock().slots[&ino].pin.is_none());
+    }
+
+    #[test]
+    fn rejected_removal_clears_pin_but_unlinked_lookup_retains_identity() {
+        let (temp, table, file, stat) = fixture();
+        let node = table.intern(entry(&file, stat), 1).unwrap();
+        let ino = node.ino;
+        drop(node);
+        std::fs::create_dir(temp.path().join("directory")).unwrap();
+        for _ in 0..128 {
+            assert_eq!(table.pin_removed(entry(&file, stat)).unwrap(), ino);
+            assert_eq!(
+                sys::rename_at(
+                    table.mount.as_fd(),
+                    c"directory",
+                    table.mount.as_fd(),
+                    c"file",
+                    0
+                )
+                .unwrap_err()
+                .raw_os_error(),
+                Some(libc::ENOTDIR)
+            );
+            assert!(table.state.lock().slots[&ino].pin.is_some());
+            let request = table.get(ino).unwrap();
+            table.release_linked_pin(ino);
+            assert!(table.state.lock().slots[&ino].pin.is_none());
+            assert_eq!(sys::stat(request.fd.as_fd()).unwrap().st_ino, stat.st_ino);
+        }
+        table.pin_removed(entry(&file, stat)).unwrap();
+        std::fs::remove_file(temp.path().join("file")).unwrap();
+        table.release_linked_pin(ino);
+        assert!(table.state.lock().slots[&ino].pin.is_some());
+        drop(file);
+        let removed = table.get(ino).unwrap();
+        assert_eq!(sys::stat(removed.fd.as_fd()).unwrap().st_nlink, 0);
+        table.forget(ino, 1);
+        assert!(table.get(ino).is_ok());
+        drop(removed);
+        assert!(table.get(ino).is_err());
+    }
+
+    #[test]
+    fn concurrent_forget_and_last_request_drop_reap_an_unlinked_pin() {
+        for _ in 0..32 {
+            let (temp, table, file, stat) = fixture();
+            let node = table.intern(entry(&file, stat), 1).unwrap();
+            let ino = node.ino;
+            table.pin_removed(entry(&file, stat)).unwrap();
+            std::fs::remove_file(temp.path().join("file")).unwrap();
+            table.release_linked_pin(ino);
+            let released = Arc::downgrade(node.node.as_ref().unwrap());
+            let pin = Arc::downgrade(table.state.lock().slots[&ino].pin.as_ref().unwrap());
+            drop(file);
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    drop(node);
+                });
+                scope.spawn(|| {
+                    barrier.wait();
+                    table.forget(ino, 1);
+                });
+            });
+            assert!(released.upgrade().is_none());
+            assert!(pin.upgrade().is_none());
+            assert_eq!(table.state.lock().slots.len(), 1);
+        }
+    }
+
+    #[test]
+    fn reconciliation_stat_failure_keeps_the_victim_pin() {
+        let (_temp, table, file, stat) = fixture();
+        let node = table.intern(entry(&file, stat), 1).unwrap();
+        table.pin_removed(entry(&file, stat)).unwrap();
+        table.state.lock().pin_stat_error = Some(libc::EIO);
+        table.release_linked_pin(node.ino);
+        assert!(table.state.lock().slots[&node.ino].pin.is_some());
+        table.release_linked_pin(node.ino);
+        assert!(table.state.lock().slots[&node.ino].pin.is_none());
+    }
+
+    #[test]
+    fn different_handle_with_same_native_number_is_never_interned_or_pinned() {
+        let (temp, table, file, stat) = fixture();
+        let node = table.intern(entry(&file, stat), 1).unwrap();
+        let other = File::create(temp.path().join("other")).unwrap();
+        let mut recycled = sys::stat(other.as_fd()).unwrap();
+        recycled.st_ino = stat.st_ino;
+        assert_eq!(
+            table
+                .intern(entry(&other, recycled), 1)
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ESTALE)
+        );
+        assert_eq!(
+            table
+                .pin_removed(entry(&other, recycled))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ESTALE)
+        );
+        let state = table.state.lock();
+        assert_eq!(state.slots[&node.ino].lookups, 1);
+        assert!(state.slots[&node.ino].pin.is_none());
+    }
+
+    #[test]
+    fn cold_materialization_verifies_native_identity() {
+        let (_temp, table, file, stat) = fixture();
+        let node = table.intern(entry(&file, stat), 1).unwrap();
+        let ino = node.ino;
+        drop(node);
+        {
+            let mut state = table.state.lock();
+            let slot = state.slots.get_mut(&ino).unwrap();
+            Arc::get_mut(&mut slot.node).unwrap().native_key.ino += 1;
+        }
+        assert_eq!(
+            table.get(ino).err().unwrap().raw_os_error(),
+            Some(libc::ESTALE)
+        );
+    }
+
+    #[test]
+    fn concurrent_get_and_pin_clear_keep_the_request_fd_live() {
+        let (_temp, table, file, stat) = fixture();
+        let node = table.intern(entry(&file, stat), 1).unwrap();
+        let ino = node.ino;
+        drop(node);
+        for _ in 0..32 {
+            table.pin_removed(entry(&file, stat)).unwrap();
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                let request = scope.spawn(|| {
+                    let request = table.get(ino).unwrap();
+                    barrier.wait();
+                    barrier.wait();
+                    assert_eq!(sys::stat(request.fd.as_fd()).unwrap().st_ino, stat.st_ino);
+                });
+                barrier.wait();
+                table.release_linked_pin(ino);
+                assert!(table.state.lock().slots[&ino].pin.is_none());
+                barrier.wait();
+                request.join().unwrap();
+            });
         }
     }
 

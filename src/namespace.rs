@@ -79,6 +79,7 @@ impl Entry {
 enum Mutator {
     Create,
     Mkdir,
+    Mknod,
     Symlink,
     Unlink,
     Rmdir,
@@ -92,7 +93,7 @@ fn known_rejection(op: Mutator, errno: Option<i32>) -> bool {
             Mutator::Create,
             Some(libc::EEXIST | libc::EMFILE | libc::ENFILE)
         ) | (
-            Mutator::Mkdir | Mutator::Symlink,
+            Mutator::Mkdir | Mutator::Mknod | Mutator::Symlink,
             Some(libc::EEXIST | libc::ENOENT | libc::ENOTDIR)
         ) | (
             Mutator::Unlink,
@@ -139,6 +140,10 @@ pub struct Namespace {
     notification_pending: AtomicBool,
     #[cfg(test)]
     fault: parking_lot::Mutex<Option<(Fault, i32)>>,
+    #[cfg(test)]
+    terminal_stats: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    listing_hints: std::sync::atomic::AtomicUsize,
 }
 
 pub struct ReadGuard<'a> {
@@ -150,7 +155,14 @@ pub struct WriteGuard<'a> {
     namespace: &'a Namespace,
     _guard: RwLockWriteGuard<'a, ()>,
     outcome: Outcome,
-    directory: Option<u64>,
+    directories: [Option<u64>; 2],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkPurpose {
+    ListingHints,
+    StrictDurability,
+    EmptyCheck,
 }
 
 fn dots(name: &CStr) -> bool {
@@ -167,6 +179,8 @@ fn kind(mode: u32) -> io::Result<u8> {
         libc::S_IFREG => Ok(libc::DT_REG),
         libc::S_IFDIR => Ok(libc::DT_DIR),
         libc::S_IFLNK => Ok(libc::DT_LNK),
+        libc::S_IFIFO => Ok(libc::DT_FIFO),
+        libc::S_IFSOCK => Ok(libc::DT_SOCK),
         _ => Err(error(libc::EOPNOTSUPP)),
     }
 }
@@ -232,6 +246,10 @@ impl Namespace {
             notification_pending: AtomicBool::new(false),
             #[cfg(test)]
             fault: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            terminal_stats: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            listing_hints: std::sync::atomic::AtomicUsize::new(0),
         };
         namespace.cleanup_probe()?;
         namespace.probe()?;
@@ -270,7 +288,7 @@ impl Namespace {
             namespace: self,
             _guard: guard,
             outcome: Outcome::Unchanged,
-            directory: None,
+            directories: [None; 2],
         })
     }
 
@@ -311,26 +329,23 @@ impl Namespace {
         }
     }
 
-    fn check_object(&self, stat: &libc::stat, long: bool) -> io::Result<()> {
+    fn check_object(&self, stat: &libc::stat) -> io::Result<()> {
         let kind = kind(stat.st_mode)?;
-        if (kind != libc::DT_DIR && stat.st_nlink != 1) || (long && kind == libc::DT_LNK) {
+        if kind != libc::DT_DIR && stat.st_nlink != 1 {
             return Err(error(libc::EOPNOTSUPP));
         }
         Ok(())
     }
 
-    fn stat_entry(
-        &self,
-        parent: BorrowedFd<'_>,
-        name: &CStr,
-        long: bool,
-    ) -> io::Result<libc::statx> {
+    fn stat_entry(&self, parent: BorrowedFd<'_>, name: &CStr) -> io::Result<libc::statx> {
+        #[cfg(test)]
+        self.terminal_stats.fetch_add(1, Ordering::Relaxed);
         let stat = sys::statx_name(parent, name, 0)?;
         if stat.stx_mnt_id != self.mount_id {
             return Err(error(libc::EXDEV));
         }
         let kind = kind(stat.stx_mode as u32)?;
-        if (kind != libc::DT_DIR && stat.stx_nlink != 1) || (long && kind == libc::DT_LNK) {
+        if kind != libc::DT_DIR && stat.stx_nlink != 1 {
             return Err(error(libc::EOPNOTSUPP));
         }
         Ok(stat)
@@ -343,7 +358,7 @@ impl Namespace {
         with_parent: bool,
     ) -> io::Result<Entry> {
         let mut entry = Entry::from_fd(sys::open_path_at(parent, name.path())?)?;
-        self.check_object(&entry.stat, name.is_long())?;
+        self.check_object(&entry.stat)?;
         if with_parent && entry.stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
             entry.parent = Some(sys::duplicate(parent)?);
         }
@@ -351,7 +366,7 @@ impl Namespace {
     }
 
     fn private_file(&self, parent: BorrowedFd<'_>, name: &CStr) -> io::Result<()> {
-        let stat = self.stat_entry(parent, name, true)?;
+        let stat = self.stat_entry(parent, name)?;
         if stat.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG {
             return Err(error(libc::EOPNOTSUPP));
         }
@@ -433,6 +448,7 @@ impl Namespace {
                 }
                 Err(err) => return Err(err),
             }
+            sys::probe_native_handle(file.as_fd(), self.root_fd())?;
             sys::set_xattr(file.as_fd(), c"user.lnfs_lite.probe", b"probe")?;
             if sys::read_xattr(file.as_fd(), c"user.lnfs_lite.probe", 5)? != b"probe" {
                 return Err(error(libc::EIO));
@@ -526,30 +542,49 @@ impl Namespace {
         Ok(())
     }
 
+    fn entry_hint(
+        &self,
+        parent: BorrowedFd<'_>,
+        entry: &sys::DirectoryEntry,
+    ) -> io::Result<(u64, u8)> {
+        match entry.kind {
+            libc::DT_REG | libc::DT_DIR | libc::DT_LNK | libc::DT_FIFO | libc::DT_SOCK => {
+                #[cfg(test)]
+                self.listing_hints.fetch_add(1, Ordering::Relaxed);
+                Ok((entry.native_ino, entry.kind))
+            }
+            libc::DT_UNKNOWN => {
+                let stat = self.stat_entry(parent, &entry.name)?;
+                Ok((stat.stx_ino, kind(stat.stx_mode as u32)?))
+            }
+            _ => Err(error(libc::EOPNOTSUPP)),
+        }
+    }
+
     fn walk_prefix<F>(
         &self,
         fd: OwnedFd,
         prefix: &mut Vec<u8>,
-        sync: bool,
+        purpose: WalkPurpose,
         visit: &mut F,
     ) -> io::Result<()>
     where
-        F: FnMut(Vec<u8>, libc::statx) -> io::Result<()>,
+        F: FnMut(ListedEntry) -> io::Result<()>,
     {
         let mut buffers: [Vec<u8>; 5] = std::array::from_fn(|_| Vec::new());
-        self.walk_prefix_with_buffers(fd, prefix, sync, visit, &mut buffers)
+        self.walk_prefix_with_buffers(fd, prefix, purpose, visit, &mut buffers)
     }
 
     fn walk_prefix_with_buffers<F>(
         &self,
         fd: OwnedFd,
         prefix: &mut Vec<u8>,
-        sync: bool,
+        purpose: WalkPurpose,
         visit: &mut F,
         buffers: &mut [Vec<u8>],
     ) -> io::Result<()>
     where
-        F: FnMut(Vec<u8>, libc::statx) -> io::Result<()>,
+        F: FnMut(ListedEntry) -> io::Result<()>,
     {
         let (buffer, children) = buffers.split_first_mut().ok_or_else(|| error(libc::EIO))?;
         let mut stream = sys::DirectoryStream::new(fd, buffer)?;
@@ -564,19 +599,29 @@ impl Namespace {
                 }
                 let child = sys::open_dir_at(stream.fd(), &entry.name)?;
                 prefix.extend_from_slice(&bytes[1..]);
-                self.walk_prefix_with_buffers(child, prefix, sync, visit, children)?;
+                self.walk_prefix_with_buffers(child, prefix, purpose, visit, children)?;
                 prefix.truncate(prefix.len() - FRAGMENT);
             } else if (2..=255).contains(&bytes.len()) && bytes[0] == b'e' {
-                let mut raw = prefix.clone();
+                let mut raw = Vec::with_capacity(prefix.len() + bytes.len() - 1);
+                raw.extend_from_slice(prefix);
                 raw.extend_from_slice(&bytes[1..]);
                 validate_long(&raw).map_err(|_| error(libc::EIO))?;
-                let stat = self.stat_entry(stream.fd(), &entry.name, true)?;
-                visit(raw, stat)?;
+                let (native_ino, kind) = if purpose == WalkPurpose::ListingHints {
+                    self.entry_hint(stream.fd(), &entry)?
+                } else {
+                    let stat = self.stat_entry(stream.fd(), &entry.name)?;
+                    (stat.stx_ino, kind(stat.stx_mode as u32)?)
+                };
+                visit(ListedEntry {
+                    name: OsString::from_vec(raw),
+                    native_ino,
+                    kind,
+                })?;
             } else {
                 return Err(error(libc::EIO));
             }
         }
-        if sync {
+        if purpose == WalkPurpose::StrictDurability {
             sys::sync(stream.fd())?;
         }
         Ok(())
@@ -585,14 +630,15 @@ impl Namespace {
     fn long_listing(&self, parent: BorrowedFd<'_>) -> io::Result<Vec<ListedEntry>> {
         let tree = sys::open_dir_at(parent, TREE)?;
         let mut out = Vec::new();
-        self.walk_prefix(tree, &mut Vec::new(), false, &mut |raw, stat| {
-            out.push(ListedEntry {
-                name: OsString::from_vec(raw),
-                native_ino: stat.stx_ino,
-                kind: kind(stat.stx_mode as u32)?,
-            });
-            Ok(())
-        })?;
+        self.walk_prefix(
+            tree,
+            &mut Vec::new(),
+            WalkPurpose::ListingHints,
+            &mut |entry| {
+                out.push(entry);
+                Ok(())
+            },
+        )?;
         Ok(out)
     }
 
@@ -632,8 +678,8 @@ impl Namespace {
             self.walk_prefix(
                 sys::open_dir_at(parent, TREE)?,
                 &mut Vec::new(),
-                false,
-                &mut |_, _| Err(error(libc::ENOTEMPTY)),
+                WalkPurpose::EmptyCheck,
+                &mut |_| Err(error(libc::ENOTEMPTY)),
             )?;
             self.remove_empty_tree(sys::open_dir_at(parent, TREE)?)?;
             sys::unlink_at(parent, TREE, true)?;
@@ -668,19 +714,11 @@ impl ReadGuard<'_> {
                 continue;
             }
             validate(entry.name.to_bytes()).map_err(|_| error(libc::EIO))?;
-            let entry_kind = match entry.kind {
-                libc::DT_REG | libc::DT_DIR | libc::DT_LNK => entry.kind,
-                libc::DT_UNKNOWN => kind(
-                    self.namespace
-                        .stat_entry(stream.fd(), &entry.name, false)?
-                        .stx_mode as u32,
-                )?,
-                _ => return Err(error(libc::EOPNOTSUPP)),
-            };
+            let (native_ino, kind) = self.namespace.entry_hint(stream.fd(), &entry)?;
             out.push(ListedEntry {
                 name: OsString::from_vec(entry.name.into_bytes()),
-                native_ino: entry.native_ino,
-                kind: entry_kind,
+                native_ino,
+                kind,
             });
         }
         if has_tree {
@@ -695,9 +733,12 @@ impl ReadGuard<'_> {
             return Err(error(libc::EIO));
         }
         match sys::open_dir_at(parent, TREE) {
-            Ok(tree) => self
-                .namespace
-                .walk_prefix(tree, &mut Vec::new(), true, &mut |_, _| Ok(()))?,
+            Ok(tree) => self.namespace.walk_prefix(
+                tree,
+                &mut Vec::new(),
+                WalkPurpose::StrictDurability,
+                &mut |_| Ok(()),
+            )?,
             Err(err) if err.raw_os_error() == Some(libc::ENOENT) => (),
             Err(err) => return Err(err),
         }
@@ -707,14 +748,26 @@ impl ReadGuard<'_> {
 }
 
 impl WriteGuard<'_> {
+    pub fn lookup(&self, parent: BorrowedFd<'_>, raw: &OsStr) -> io::Result<Entry> {
+        self.namespace.open_entry(parent, &Name::new(raw)?, true)
+    }
+
     pub fn did_commit(&self) -> bool {
         self.outcome == Outcome::Committed
     }
     pub fn needs_invalidation(&self) -> bool {
         self.outcome != Outcome::Unchanged
     }
-    pub fn directory_to_invalidate(&self) -> Option<u64> {
-        self.directory
+    pub fn directories_to_invalidate(&self) -> [Option<u64>; 2] {
+        self.directories
+    }
+
+    fn invalidate_directory(&mut self, native_ino: u64) {
+        if self.directories[0].is_none() {
+            self.directories[0] = Some(native_ino);
+        } else if self.directories[0] != Some(native_ino) {
+            self.directories[1] = Some(native_ino);
+        }
     }
 
     pub fn mark_notification_pending(&mut self) {
@@ -820,6 +873,27 @@ impl WriteGuard<'_> {
         Ok(entry)
     }
 
+    pub fn mknod(&mut self, parent: Directory<'_>, raw: &OsStr, mode: u32) -> io::Result<Entry> {
+        if !matches!(
+            mode & libc::S_IFMT,
+            libc::S_IFREG | libc::S_IFIFO | libc::S_IFSOCK
+        ) {
+            return Err(error(libc::EOPNOTSUPP));
+        }
+        let name = Name::new(raw)?;
+        let physical = if name.is_long() {
+            Some(self.namespace.ensure_parent(parent, &name)?)
+        } else {
+            None
+        };
+        let at = physical.as_ref().map_or(parent.fd, AsFd::as_fd);
+        self.logical(Mutator::Mknod, sys::mknod_at(at, name.leaf(), mode))?;
+        if name.is_long() {
+            self.after_commit(self.namespace.touch(parent.fd))?;
+        }
+        self.namespace.open_entry(parent.fd, &name, false)
+    }
+
     pub fn symlink(
         &mut self,
         parent: Directory<'_>,
@@ -827,14 +901,17 @@ impl WriteGuard<'_> {
         target: &OsStr,
     ) -> io::Result<Entry> {
         let name = Name::new(raw)?;
-        if name.is_long() {
-            return Err(error(libc::EOPNOTSUPP));
-        }
         let target = CString::new(target.as_bytes()).map_err(|_| error(libc::EINVAL))?;
-        self.logical(
-            Mutator::Symlink,
-            sys::symlink_at(parent.fd, name.path(), &target),
-        )?;
+        let physical = if name.is_long() {
+            Some(self.namespace.ensure_parent(parent, &name)?)
+        } else {
+            None
+        };
+        let at = physical.as_ref().map_or(parent.fd, AsFd::as_fd);
+        self.logical(Mutator::Symlink, sys::symlink_at(at, name.leaf(), &target))?;
+        if name.is_long() {
+            self.after_commit(self.namespace.touch(parent.fd))?;
+        }
         self.namespace.open_entry(parent.fd, &name, false)
     }
 
@@ -855,7 +932,7 @@ impl WriteGuard<'_> {
             None
         };
         let at = physical.as_ref().map_or(parent.fd, AsFd::as_fd);
-        let stat = self.namespace.stat_entry(at, name.leaf(), name.is_long())?;
+        let stat = self.namespace.stat_entry(at, name.leaf())?;
         let is_dir = stat.stx_mode as u32 & libc::S_IFMT == libc::S_IFDIR;
         if directory && !is_dir {
             return Err(error(libc::ENOTDIR));
@@ -864,7 +941,7 @@ impl WriteGuard<'_> {
             return Err(error(libc::EISDIR));
         }
         if directory {
-            self.directory = Some(stat.stx_ino);
+            self.invalidate_directory(stat.stx_ino);
             let child = sys::open_path_at(at, name.leaf())?;
             self.namespace.clean_logical_directory(child.as_fd())?;
         }
@@ -890,13 +967,16 @@ impl WriteGuard<'_> {
         new_parent: Directory<'_>,
         new_raw: &OsStr,
         flags: u32,
-        directory_commit: impl FnOnce(u64, OwnedFd),
+        mut directory_commit: impl FnMut(u64, OwnedFd),
     ) -> io::Result<()> {
         let known = libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT;
         if flags & !known != 0 {
             return Err(error(libc::EINVAL));
         }
-        if flags & (libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT) != 0 {
+        if flags & libc::RENAME_EXCHANGE != 0 && flags != libc::RENAME_EXCHANGE {
+            return Err(error(libc::EINVAL));
+        }
+        if flags & libc::RENAME_WHITEOUT != 0 {
             return Err(error(libc::EOPNOTSUPP));
         }
         let old = Name::new(old_raw)?;
@@ -910,10 +990,10 @@ impl WriteGuard<'_> {
                 Ok(())
             };
         }
-        let source_kind = kind(source.stat.st_mode)?;
-        if source_kind == libc::DT_LNK && new.is_long() {
-            return Err(error(libc::EOPNOTSUPP));
+        if flags == libc::RENAME_EXCHANGE {
+            return self.exchange(old_parent, &old, new_parent, &new, source, directory_commit);
         }
+        let source_kind = kind(source.stat.st_mode)?;
         let target = match self.namespace.open_entry(new_parent.fd, &new, false) {
             Ok(entry) => Some(entry),
             Err(err) if err.raw_os_error() == Some(libc::ENOENT) => None,
@@ -935,7 +1015,7 @@ impl WriteGuard<'_> {
             }
         }
         let next_parent = if source_kind == libc::DT_DIR {
-            self.directory = Some(source.stat.st_ino);
+            self.invalidate_directory(source.stat.st_ino);
             Some(sys::duplicate(new_parent.fd)?)
         } else {
             None
@@ -963,6 +1043,53 @@ impl WriteGuard<'_> {
             && !(same_parent && new.is_long() && old.parent_bytes() == new.parent_bytes())
         {
             self.after_commit(self.namespace.prune(old_parent.fd, &old))?;
+        }
+        Ok(())
+    }
+
+    fn exchange(
+        &mut self,
+        old_parent: Directory<'_>,
+        old: &Name<'_>,
+        new_parent: Directory<'_>,
+        new: &Name<'_>,
+        source: Entry,
+        mut directory_commit: impl FnMut(u64, OwnedFd),
+    ) -> io::Result<()> {
+        let target = self.namespace.open_entry(new_parent.fd, new, false)?;
+        let source_parent = if source.stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            self.invalidate_directory(source.stat.st_ino);
+            Some(sys::duplicate(new_parent.fd)?)
+        } else {
+            None
+        };
+        let target_parent = if target.stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            self.invalidate_directory(target.stat.st_ino);
+            Some(sys::duplicate(old_parent.fd)?)
+        } else {
+            None
+        };
+        self.logical(
+            Mutator::Rename,
+            sys::rename_at(
+                old_parent.fd,
+                old.path(),
+                new_parent.fd,
+                new.path(),
+                libc::RENAME_EXCHANGE,
+            ),
+        )?;
+        if let Some(parent) = source_parent {
+            directory_commit(source.stat.st_ino, parent);
+        }
+        if let Some(parent) = target_parent {
+            directory_commit(target.stat.st_ino, parent);
+        }
+        if old.is_long() || new.is_long() {
+            self.after_commit(self.namespace.touch(old_parent.fd))?;
+            if old_parent.key != new_parent.key {
+                self.after_commit(self.namespace.touch(new_parent.fd))?;
+            }
         }
         Ok(())
     }
@@ -1007,6 +1134,456 @@ mod tests {
             sys::read_xattr(ns.root_fd(), FORMAT_XATTR, 64).unwrap(),
             FORMAT
         );
+    }
+
+    #[test]
+    fn long_symlink_names_preserve_raw_targets_and_rename_identity() {
+        for len in [255, 256, 300, 509, 1024] {
+            for target in [
+                b"relative/target".as_slice(),
+                b"/absolute/missing",
+                b"raw-\xff-target",
+            ] {
+                let (temp, ns) = fixture();
+                let name = long(0xfe, len);
+                let entry = ns
+                    .write()
+                    .unwrap()
+                    .symlink(ns.root_directory(), &name, OsStr::from_bytes(target))
+                    .unwrap();
+                assert_eq!(entry.stat.st_mode & libc::S_IFMT, libc::S_IFLNK);
+                assert_eq!(
+                    fs::read_link(native_path(temp.path(), &name))
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes(),
+                    target
+                );
+                assert_eq!(
+                    ns.read()
+                        .unwrap()
+                        .lookup(ns.root_fd(), &name)
+                        .unwrap()
+                        .stat
+                        .st_ino,
+                    entry.stat.st_ino
+                );
+                assert_eq!(
+                    ns.read().unwrap().list(ns.root_directory()).unwrap()[0].kind,
+                    libc::DT_LNK
+                );
+                let short = OsStr::new("renamed");
+                ns.write()
+                    .unwrap()
+                    .rename(
+                        ns.root_directory(),
+                        &name,
+                        ns.root_directory(),
+                        short,
+                        0,
+                        |_, _| panic!("symlink is not a directory"),
+                    )
+                    .unwrap();
+                ns.write()
+                    .unwrap()
+                    .rename(
+                        ns.root_directory(),
+                        short,
+                        ns.root_directory(),
+                        &name,
+                        0,
+                        |_, _| panic!("symlink is not a directory"),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    ns.read()
+                        .unwrap()
+                        .lookup(ns.root_fd(), &name)
+                        .unwrap()
+                        .stat
+                        .st_ino,
+                    entry.stat.st_ino
+                );
+                ns.write()
+                    .unwrap()
+                    .unlink(ns.root_directory(), &name, false)
+                    .unwrap();
+                assert_eq!(sys::stat(entry.fd.as_fd()).unwrap().st_nlink, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn special_nodes_are_native_and_device_nodes_remain_rejected() {
+        let (temp, ns) = fixture();
+        for (index, mode) in [libc::S_IFREG, libc::S_IFIFO, libc::S_IFSOCK]
+            .into_iter()
+            .enumerate()
+        {
+            for length in [16, 300, 1024] {
+                let name = long(b'a' + index as u8, length);
+                let entry = ns
+                    .write()
+                    .unwrap()
+                    .mknod(ns.root_directory(), &name, mode | 0o600)
+                    .unwrap();
+                assert_eq!(entry.stat.st_mode & libc::S_IFMT, mode);
+                assert_eq!(entry.stat.st_mode & 0o7777, 0o600);
+                assert_eq!(
+                    ns.read().unwrap().list(ns.root_directory()).unwrap()[0].kind,
+                    kind(mode).unwrap()
+                );
+                let alias = temp.path().join("alias");
+                fs::hard_link(native_path(temp.path(), &name), &alias).unwrap();
+                assert_eq!(
+                    ns.write()
+                        .unwrap()
+                        .unlink(ns.root_directory(), &name, false)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::EOPNOTSUPP)
+                );
+                fs::remove_file(alias).unwrap();
+                ns.write()
+                    .unwrap()
+                    .unlink(ns.root_directory(), &name, false)
+                    .unwrap();
+            }
+        }
+        for mode in [libc::S_IFCHR, libc::S_IFBLK, libc::S_IFDIR, libc::S_IFLNK] {
+            let mut guard = ns.write().unwrap();
+            assert_eq!(
+                guard
+                    .mknod(ns.root_directory(), OsStr::new("rejected"), mode)
+                    .err()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+            );
+            assert!(!guard.needs_invalidation());
+        }
+        assert!(!ns.is_faulted());
+    }
+
+    #[test]
+    fn new_node_mutators_keep_unknown_and_postcommit_faults_distinct() {
+        for op in [Mutator::Symlink, Mutator::Mknod] {
+            for point in [Fault::Native(op), Fault::Touch] {
+                let (temp, ns) = fixture();
+                let name = long(b'x', 300);
+                *ns.fault.lock() = Some((point, libc::EIO));
+                let mut guard = ns.write().unwrap();
+                let result = if op == Mutator::Symlink {
+                    guard.symlink(ns.root_directory(), &name, OsStr::new("missing"))
+                } else {
+                    guard.mknod(ns.root_directory(), &name, libc::S_IFIFO | 0o600)
+                };
+                assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::EIO));
+                assert_eq!(guard.did_commit(), point == Fault::Touch);
+                assert!(guard.needs_invalidation());
+                drop(guard);
+                assert!(fs::symlink_metadata(native_path(temp.path(), &name)).is_ok());
+                if point == Fault::Touch {
+                    assert!(ns.read().unwrap().lookup(ns.root_fd(), &name).is_ok());
+                } else {
+                    assert_unknown(&ns);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exchange_preserves_both_objects_and_reparents_each_directory() {
+        for length in [16, 300, 1024] {
+            for cross_parent in [false, true] {
+                for (source_dir, target_dir) in
+                    [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    let (_temp, ns) = fixture();
+                    let left = ns
+                        .write()
+                        .unwrap()
+                        .mkdir(ns.root_directory(), OsStr::new("left"), 0o700)
+                        .unwrap();
+                    let right = ns
+                        .write()
+                        .unwrap()
+                        .mkdir(ns.root_directory(), OsStr::new("right"), 0o700)
+                        .unwrap();
+                    let a = left.directory().unwrap();
+                    let b = if cross_parent {
+                        right.directory().unwrap()
+                    } else {
+                        a
+                    };
+                    let old = long(b'a', length);
+                    let new = long(b'b', length);
+                    let make = |parent, name: &OsStr, directory| {
+                        if directory {
+                            let entry = ns.write().unwrap().mkdir(parent, name, 0o700).unwrap();
+                            create(&ns, entry.directory().unwrap(), &long(b'z', 300));
+                            entry
+                        } else {
+                            create(&ns, parent, name)
+                        }
+                    };
+                    let source = make(a, &old, source_dir);
+                    let target = make(b, &new, target_dir);
+                    let mut changed = BTreeMap::new();
+                    let mut guard = ns.write().unwrap();
+                    guard
+                        .rename(a, &old, b, &new, libc::RENAME_EXCHANGE, |ino, fd| {
+                            assert!(
+                                changed
+                                    .insert(ino, sys::stat(fd.as_fd()).unwrap().st_ino)
+                                    .is_none()
+                            );
+                        })
+                        .unwrap();
+                    assert!(guard.did_commit());
+                    assert_eq!(
+                        guard
+                            .directories_to_invalidate()
+                            .into_iter()
+                            .flatten()
+                            .count(),
+                        usize::from(source_dir) + usize::from(target_dir)
+                    );
+                    drop(guard);
+                    assert_eq!(
+                        ns.read()
+                            .unwrap()
+                            .lookup(a.as_fd(), &old)
+                            .unwrap()
+                            .stat
+                            .st_ino,
+                        target.stat.st_ino
+                    );
+                    assert_eq!(
+                        ns.read()
+                            .unwrap()
+                            .lookup(b.as_fd(), &new)
+                            .unwrap()
+                            .stat
+                            .st_ino,
+                        source.stat.st_ino
+                    );
+                    if source_dir {
+                        assert_eq!(changed[&source.stat.st_ino], b.key.ino);
+                        assert_eq!(
+                            ns.read()
+                                .unwrap()
+                                .list(source.directory().unwrap())
+                                .unwrap()
+                                .len(),
+                            1
+                        );
+                    }
+                    if target_dir {
+                        assert_eq!(changed[&target.stat.st_ino], a.key.ino);
+                        assert_eq!(
+                            ns.read()
+                                .unwrap()
+                                .list(target.directory().unwrap())
+                                .unwrap()
+                                .len(),
+                            1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exchange_flags_are_checked_before_same_path_and_missing_end() {
+        let (_temp, ns) = fixture();
+        let name = OsStr::new("same");
+        create(&ns, ns.root_directory(), name);
+        for flags in [
+            libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE,
+            libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT,
+            u32::MAX,
+        ] {
+            let mut guard = ns.write().unwrap();
+            assert_eq!(
+                guard
+                    .rename(
+                        ns.root_directory(),
+                        name,
+                        ns.root_directory(),
+                        name,
+                        flags,
+                        |_, _| ()
+                    )
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            assert!(!guard.needs_invalidation());
+        }
+        let mut guard = ns.write().unwrap();
+        guard
+            .rename(
+                ns.root_directory(),
+                name,
+                ns.root_directory(),
+                name,
+                libc::RENAME_EXCHANGE,
+                |_, _| (),
+            )
+            .unwrap();
+        assert!(!guard.needs_invalidation());
+        assert_eq!(
+            guard
+                .rename(
+                    ns.root_directory(),
+                    name,
+                    ns.root_directory(),
+                    OsStr::new("missing"),
+                    libc::RENAME_EXCHANGE,
+                    |_, _| ()
+                )
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert!(!guard.needs_invalidation());
+    }
+
+    #[test]
+    fn exchange_faults_retain_two_invalidation_targets() {
+        for point in [Fault::Native(Mutator::Rename), Fault::Touch] {
+            let (temp, ns) = fixture();
+            let old = long(b'a', 300);
+            let new = long(b'b', 300);
+            let source = ns
+                .write()
+                .unwrap()
+                .mkdir(ns.root_directory(), &old, 0o700)
+                .unwrap();
+            let target = ns
+                .write()
+                .unwrap()
+                .mkdir(ns.root_directory(), &new, 0o700)
+                .unwrap();
+            *ns.fault.lock() = Some((point, libc::EIO));
+            let mut parents = Vec::new();
+            let mut guard = ns.write().unwrap();
+            assert_eq!(
+                guard
+                    .rename(
+                        ns.root_directory(),
+                        &old,
+                        ns.root_directory(),
+                        &new,
+                        libc::RENAME_EXCHANGE,
+                        |ino, fd| parents.push((ino, fd))
+                    )
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+            assert!(guard.needs_invalidation());
+            assert_eq!(guard.did_commit(), point == Fault::Touch);
+            assert_eq!(
+                guard.directories_to_invalidate(),
+                [Some(source.stat.st_ino), Some(target.stat.st_ino)]
+            );
+            assert_eq!(parents.len(), if point == Fault::Touch { 2 } else { 0 });
+            drop(guard);
+            let actual = sys::open_root(&native_path(temp.path(), &old)).unwrap();
+            assert_eq!(
+                sys::stat(actual.as_fd()).unwrap().st_ino,
+                target.stat.st_ino
+            );
+            if point == Fault::Touch {
+                assert!(ns.read().is_ok());
+            } else {
+                assert_unknown(&ns);
+            }
+        }
+    }
+
+    #[test]
+    fn listing_hints_skip_terminal_stats_but_durability_and_unknown_types_do_not() {
+        let (temp, ns) = fixture();
+        for byte in b'a'..b'a' + 32 {
+            create(&ns, ns.root_directory(), &long(byte, 300));
+        }
+        let before = ns.terminal_stats.load(Ordering::Relaxed);
+        assert_eq!(
+            ns.read().unwrap().list(ns.root_directory()).unwrap().len(),
+            32
+        );
+        assert_eq!(ns.listing_hints.load(Ordering::Relaxed), 32);
+        assert_eq!(ns.terminal_stats.load(Ordering::Relaxed), before);
+        ns.read().unwrap().fsync_dir(ns.root_fd()).unwrap();
+        assert_eq!(ns.terminal_stats.load(Ordering::Relaxed), before + 32);
+        let name = long(b'a', 300);
+        let encoded = Name::new(&name).unwrap();
+        let mut scratch = [0; PATH_CAPACITY];
+        let parent =
+            sys::open_dir_anchor_at(ns.root_fd(), encoded.parent_path(&mut scratch).unwrap())
+                .unwrap();
+        let mut entry = sys::DirectoryEntry {
+            name: encoded.leaf().to_owned(),
+            native_ino: 0,
+            kind: libc::DT_UNKNOWN,
+        };
+        let actual = ns.read().unwrap().lookup(ns.root_fd(), &name).unwrap();
+        assert_eq!(
+            ns.entry_hint(parent.as_fd(), &entry).unwrap(),
+            (actual.stat.st_ino, libc::DT_REG)
+        );
+        fs::hard_link(native_path(temp.path(), &name), temp.path().join("alias")).unwrap();
+        assert_eq!(
+            ns.read().unwrap().list(ns.root_directory()).unwrap().len(),
+            33
+        );
+        assert_eq!(
+            ns.read()
+                .unwrap()
+                .fsync_dir(ns.root_fd())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            ns.entry_hint(parent.as_fd(), &entry)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            ns.write()
+                .unwrap()
+                .unlink(ns.root_directory(), &name, false)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+        entry.kind = libc::DT_CHR;
+        assert_eq!(
+            ns.entry_hint(parent.as_fd(), &entry)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+    }
+
+    #[test]
+    fn hint_walk_still_rejects_intermediate_symlinks() {
+        let (temp, ns) = fixture();
+        let name = long(b'a', 300);
+        create(&ns, ns.root_directory(), &name);
+        let branch = native_path(temp.path(), &name).parent().unwrap().to_owned();
+        let hidden = temp.path().join("hidden");
+        fs::rename(&branch, &hidden).unwrap();
+        symlink(&hidden, &branch).unwrap();
+        assert!(ns.read().unwrap().list(ns.root_directory()).is_err());
+        assert!(ns.read().unwrap().fsync_dir(ns.root_fd()).is_err());
+        assert!(ns.read().unwrap().lookup(ns.root_fd(), &name).is_err());
     }
 
     #[test]
@@ -1104,9 +1681,9 @@ mod tests {
             ns.walk_prefix_with_buffers(
                 tree,
                 &mut Vec::new(),
-                false,
-                &mut |name, stat| {
-                    seen.push((name, stat.stx_ino));
+                WalkPurpose::ListingHints,
+                &mut |entry| {
+                    seen.push((entry.name.into_vec(), entry.native_ino));
                     Ok(())
                 },
                 &mut buffers,
@@ -1150,8 +1727,8 @@ mod tests {
             let failure = ns.walk_prefix_with_buffers(
                 sys::open_dir_at(ns.root_fd(), TREE).unwrap(),
                 &mut Vec::new(),
-                false,
-                &mut |_, _| {
+                WalkPurpose::ListingHints,
+                &mut |_| {
                     visited += 1;
                     if visited == 2 {
                         Err(error(errno))
@@ -1171,9 +1748,12 @@ mod tests {
         ns.walk_prefix_with_buffers(
             sys::open_dir_at(ns.root_fd(), TREE).unwrap(),
             &mut Vec::new(),
-            false,
-            &mut |name, stat| {
-                assert!(seen.insert(name, stat.stx_ino).is_none());
+            WalkPurpose::ListingHints,
+            &mut |entry| {
+                assert!(
+                    seen.insert(entry.name.into_vec(), entry.native_ino)
+                        .is_none()
+                );
                 Ok(())
             },
             &mut buffers,
@@ -1509,7 +2089,10 @@ mod tests {
             assert!(!called.get());
             assert!(!guard.did_commit());
             assert!(guard.needs_invalidation());
-            assert_eq!(guard.directory_to_invalidate(), Some(child.stat.st_ino));
+            assert_eq!(
+                guard.directories_to_invalidate(),
+                [Some(child.stat.st_ino), None]
+            );
             drop(guard);
             assert_unknown(&ns);
             ns.finish_notifications(true);
@@ -1633,6 +2216,7 @@ mod tests {
         let cases: &[(Mutator, &[i32])] = &[
             (Mutator::Create, &[libc::EEXIST, libc::EMFILE, libc::ENFILE]),
             (Mutator::Mkdir, &[libc::EEXIST, libc::ENOENT, libc::ENOTDIR]),
+            (Mutator::Mknod, &[libc::EEXIST, libc::ENOENT, libc::ENOTDIR]),
             (
                 Mutator::Symlink,
                 &[libc::EEXIST, libc::ENOENT, libc::ENOTDIR],
@@ -1718,7 +2302,7 @@ mod tests {
     }
 
     #[test]
-    fn real_leaf_checks_reject_hardlinks_and_long_symlinks() {
+    fn real_leaf_checks_reject_hardlinks_including_symlinks() {
         let (temp, ns) = fixture();
         let name = long(b'u', 300);
         create(&ns, ns.root_directory(), &name);
@@ -1756,15 +2340,6 @@ mod tests {
             ns.write()
                 .unwrap()
                 .unlink(ns.root_directory(), OsStr::new("symbol"), false)
-                .err()
-                .unwrap()
-                .raw_os_error(),
-            Some(libc::EOPNOTSUPP)
-        );
-        assert_eq!(
-            ns.write()
-                .unwrap()
-                .symlink(ns.root_directory(), &long(b'v', 300), OsStr::new("target"))
                 .err()
                 .unwrap()
                 .raw_os_error(),
